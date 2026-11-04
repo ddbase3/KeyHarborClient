@@ -1,0 +1,12 @@
+{
+	"manifestVersion": 1,
+	"name": "KeyHarborClient",
+	"namespace": "KeyHarborClient",
+	"version": "1.0.0",
+	"description": "Reusable KeyHarbor-signed BASE3 microservice connector for client applications.",
+	"license": "GPL-3.0-or-later",
+	"dependencies": {
+		"Base3Framework": ">=4.10.0",
+		"CredentialFoundation": ">=4.3.0"
+	}
+}
