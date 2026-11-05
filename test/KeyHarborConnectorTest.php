@@ -34,6 +34,7 @@ namespace KeyHarborClient\Test {
 	use KeyHarborClient\Test\Support\ITestMicroservice;
 	use KeyHarborClient\Test\Support\TestConfiguration;
 	use RuntimeException;
+	use PHPUnit\Framework\TestCase;
 
 	if (!defined('DIR_ROOT')) define('DIR_ROOT', dirname(__DIR__, 3) . '/');
 	if (!defined('DIR_SRC')) define('DIR_SRC', DIR_ROOT . 'src/');
@@ -53,88 +54,91 @@ namespace KeyHarborClient\Test {
 		if (!defined($constant)) define($constant, count(get_defined_constants()) + 100);
 	}
 
-	function check(bool $condition, string $message): void {
-		if (!$condition) throw new RuntimeException('Test failed: ' . $message);
-	}
+	final class KeyHarborConnectorTest extends TestCase {
 
-	function expectFailure(callable $action, string $message): void {
-		try {
-			$action();
-		} catch (RuntimeException) {
-			return;
+		public function testConnectorKeepsTheBase3ProtocolAndRejectsFailures(): void {
+			$token = 'b3k_' . str_repeat('c', 20) . '_' . str_repeat('d', 43);
+			$configuration = new TestConfiguration($token);
+			$GLOBALS['khc_test_calls'] = 0;
+			$GLOBALS['khc_test_options_ok'] = true;
+			$GLOBALS['khc_test_status'] = 200;
+			$GLOBALS['khc_test_response'] = '[]';
+
+			$this->check(is_subclass_of(KeyHarborConnector::class, \Base3\Microservice\AbstractMicroserviceConnector::class), 'inherits BASE3 transport protocol');
+			$connector = new KeyHarborConnector(
+				'https://xrm.example.org/examplemicroservice.json?source=website',
+				ITestMicroservice::class,
+				$configuration,
+				'remote',
+				'token',
+				['getRecords' => 'list', 'getRecord' => '?array', 'getEnabled' => 'bool']
+			);
+			$this->check($connector->getMicroserviceUrl() === 'https://xrm.example.org/examplemicroservice.json?source=website', 'endpoint retained');
+			$this->check($configuration->reads === 0 && $GLOBALS['khc_test_calls'] === 0, 'construction is side-effect free');
+			$this->check($connector->getRecords('photo') === [], 'default parameter result');
+			$this->check($configuration->reads === 1 && $GLOBALS['khc_test_calls'] === 1, 'credential read on request only');
+
+			$options = $GLOBALS['khc_test_options'];
+			$this->check($GLOBALS['khc_test_url'] === $connector->getMicroserviceUrl(), 'exact URL');
+			$this->check($options[CURLOPT_FOLLOWLOCATION] === false && $options[CURLOPT_SSL_VERIFYPEER] === true && $options[CURLOPT_SSL_VERIFYHOST] === 2, 'TLS and redirect policy');
+			parse_str($options[CURLOPT_POSTFIELDS], $form);
+			$this->check($form['call'] === 'getRecords', 'method name');
+			$this->check(json_decode($form['params'], true, 512, JSON_THROW_ON_ERROR) === ['category' => 'photo', 'limit' => 5], 'reflection and default argument mapping');
+			$headers = [];
+			foreach ($options[CURLOPT_HTTPHEADER] as $header) {
+				[$name, $value] = explode(': ', $header, 2);
+				$headers[$name] = $value;
+			}
+			$this->check($headers['Authorization'] === 'Bearer ' . $token, 'service credential');
+			$canonical = implode("\n", ['POST', '/examplemicroservice.json', 'source=website', $headers['X-Base3-Timestamp'], $headers['X-Base3-Nonce'], hash('sha256', $options[CURLOPT_POSTFIELDS])]);
+			$this->check($headers['X-Base3-Signature'] === hash_hmac('sha256', $canonical, str_repeat('d', 43)), 'canonical path and query HMAC');
+
+			$GLOBALS['khc_test_response'] = '{"id":42}';
+			$this->check($connector->getRecord(42) === ['id' => 42], 'optional array result');
+			$GLOBALS['khc_test_response'] = 'null';
+			$this->check($connector->getRecord(1000) === null, 'genuine missing result');
+			$GLOBALS['khc_test_response'] = 'true';
+			$this->check($connector->getEnabled() === true, 'service-independent return shape');
+
+			$GLOBALS['khc_test_response'] = '{"error":"unexpected"}';
+			$this->expectFailure(fn() => $connector->getRecords('photo'), 'object response cannot become a complete list');
+			$GLOBALS['khc_test_response'] = 'not json';
+			$this->expectFailure(fn() => $connector->getRecord(42), 'invalid json');
+			$GLOBALS['khc_test_response'] = '[]';
+			$GLOBALS['khc_test_status'] = 403;
+			$this->expectFailure(fn() => $connector->getRecords('photo'), 'denied');
+			$GLOBALS['khc_test_status'] = 200;
+			$GLOBALS['khc_test_response'] = false;
+			$this->expectFailure(fn() => $connector->getRecords('photo'), 'transport failure');
+			$GLOBALS['khc_test_response'] = '[]';
+			$GLOBALS['khc_test_options_ok'] = false;
+			$this->expectFailure(fn() => $connector->getRecords('photo'), 'curl setup failure');
+			$GLOBALS['khc_test_options_ok'] = true;
+
+			$calls = $GLOBALS['khc_test_calls'];
+			$this->expectFailure(fn() => $connector->deleteRecord(42), 'not in allowed operation map');
+			$this->expectFailure(fn() => $connector->getRecords(), 'missing argument');
+			$this->expectFailure(fn() => $connector->getRecords('photo', 5, 2), 'extra argument');
+			$this->check($GLOBALS['khc_test_calls'] === $calls, 'disallowed or malformed calls do not reach network');
+
+			$configuration->token = 'invalid';
+			$this->expectFailure(fn() => $connector->getRecords('photo'), 'credential rejected before transport');
+			$this->check($GLOBALS['khc_test_calls'] === $calls, 'credential rejected before network');
+			$this->expectFailure(fn() => new KeyHarborConnector('http://xrm.example.org/api.json', ITestMicroservice::class, $configuration, 'remote', 'token', ['getRecords' => 'list']), 'HTTPS required');
+			$this->expectFailure(fn() => new KeyHarborConnector('https://xrm.example.org/api.json', ITestMicroservice::class, $configuration, 'remote', 'token', ['deleteRecord' => 'mixed']), 'interface method required');
 		}
-		throw new RuntimeException('Expected failure: ' . $message);
+
+		private function check(bool $condition, string $message): void {
+			$this->assertTrue($condition, $message);
+		}
+
+		private function expectFailure(callable $action, string $message): void {
+			try {
+				$action();
+			} catch (RuntimeException) {
+				return;
+			}
+			$this->fail('Expected failure: ' . $message);
+		}
 	}
-
-	$token = 'b3k_' . str_repeat('c', 20) . '_' . str_repeat('d', 43);
-	$configuration = new TestConfiguration($token);
-	$GLOBALS['khc_test_calls'] = 0;
-	$GLOBALS['khc_test_options_ok'] = true;
-	$GLOBALS['khc_test_status'] = 200;
-	$GLOBALS['khc_test_response'] = '[]';
-
-	check(is_subclass_of(KeyHarborConnector::class, \Base3\Microservice\AbstractMicroserviceConnector::class), 'inherits BASE3 transport protocol');
-	$connector = new KeyHarborConnector(
-		'https://xrm.example.org/examplemicroservice.json?source=website',
-		ITestMicroservice::class,
-		$configuration,
-		'remote',
-		'token',
-		['getRecords' => 'list', 'getRecord' => '?array', 'getEnabled' => 'bool']
-	);
-	check($connector->getMicroserviceUrl() === 'https://xrm.example.org/examplemicroservice.json?source=website', 'endpoint retained');
-	check($configuration->reads === 0 && $GLOBALS['khc_test_calls'] === 0, 'construction is side-effect free');
-	check($connector->getRecords('photo') === [], 'default parameter result');
-	check($configuration->reads === 1 && $GLOBALS['khc_test_calls'] === 1, 'credential read on request only');
-
-	$options = $GLOBALS['khc_test_options'];
-	check($GLOBALS['khc_test_url'] === $connector->getMicroserviceUrl(), 'exact URL');
-	check($options[CURLOPT_FOLLOWLOCATION] === false && $options[CURLOPT_SSL_VERIFYPEER] === true && $options[CURLOPT_SSL_VERIFYHOST] === 2, 'TLS and redirect policy');
-	parse_str($options[CURLOPT_POSTFIELDS], $form);
-	check($form['call'] === 'getRecords', 'method name');
-	check(json_decode($form['params'], true, 512, JSON_THROW_ON_ERROR) === ['category' => 'photo', 'limit' => 5], 'reflection and default argument mapping');
-	$headers = [];
-	foreach ($options[CURLOPT_HTTPHEADER] as $header) {
-		[$name, $value] = explode(': ', $header, 2);
-		$headers[$name] = $value;
-	}
-	check($headers['Authorization'] === 'Bearer ' . $token, 'service credential');
-	$canonical = implode("\n", ['POST', '/examplemicroservice.json', 'source=website', $headers['X-Base3-Timestamp'], $headers['X-Base3-Nonce'], hash('sha256', $options[CURLOPT_POSTFIELDS])]);
-	check($headers['X-Base3-Signature'] === hash_hmac('sha256', $canonical, str_repeat('d', 43)), 'canonical path and query HMAC');
-
-	$GLOBALS['khc_test_response'] = '{"id":42}';
-	check($connector->getRecord(42) === ['id' => 42], 'optional array result');
-	$GLOBALS['khc_test_response'] = 'null';
-	check($connector->getRecord(1000) === null, 'genuine missing result');
-	$GLOBALS['khc_test_response'] = 'true';
-	check($connector->getEnabled() === true, 'service-independent return shape');
-
-	$GLOBALS['khc_test_response'] = '{"error":"unexpected"}';
-	expectFailure(fn() => $connector->getRecords('photo'), 'object response cannot become a complete list');
-	$GLOBALS['khc_test_response'] = 'not json';
-	expectFailure(fn() => $connector->getRecord(42), 'invalid json');
-	$GLOBALS['khc_test_response'] = '[]';
-	$GLOBALS['khc_test_status'] = 403;
-	expectFailure(fn() => $connector->getRecords('photo'), 'denied');
-	$GLOBALS['khc_test_status'] = 200;
-	$GLOBALS['khc_test_response'] = false;
-	expectFailure(fn() => $connector->getRecords('photo'), 'transport failure');
-	$GLOBALS['khc_test_response'] = '[]';
-	$GLOBALS['khc_test_options_ok'] = false;
-	expectFailure(fn() => $connector->getRecords('photo'), 'curl setup failure');
-	$GLOBALS['khc_test_options_ok'] = true;
-
-	$calls = $GLOBALS['khc_test_calls'];
-	expectFailure(fn() => $connector->deleteRecord(42), 'not in allowed operation map');
-	expectFailure(fn() => $connector->getRecords(), 'missing argument');
-	expectFailure(fn() => $connector->getRecords('photo', 5, 2), 'extra argument');
-	check($GLOBALS['khc_test_calls'] === $calls, 'disallowed or malformed calls do not reach network');
-
-	$configuration->token = 'invalid';
-	expectFailure(fn() => $connector->getRecords('photo'), 'credential rejected before transport');
-	check($GLOBALS['khc_test_calls'] === $calls, 'credential rejected before network');
-	expectFailure(fn() => new KeyHarborConnector('http://xrm.example.org/api.json', ITestMicroservice::class, $configuration, 'remote', 'token', ['getRecords' => 'list']), 'HTTPS required');
-	expectFailure(fn() => new KeyHarborConnector('https://xrm.example.org/api.json', ITestMicroservice::class, $configuration, 'remote', 'token', ['deleteRecord' => 'mixed']), 'interface method required');
-
-	echo "KeyHarborClient generic connector: OK\n";
 }

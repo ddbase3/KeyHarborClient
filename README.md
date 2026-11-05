@@ -41,7 +41,7 @@ Credentials must not be committed to source control. The deployment owns provisi
 From a BASE3 installation root:
 
 ```sh
-php plugin/KeyHarborClient/test/KeyHarborConnectorTest.php
+./vendor/bin/phpunit --no-coverage plugin/KeyHarborClient/test/KeyHarborConnectorTest.php
 ```
 
 The Contourz integration is separately tested with:
